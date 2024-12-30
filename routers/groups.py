@@ -49,21 +49,26 @@ async def alert50(group_name: str):
     await manager.broadcast_to_group(group_name,"alert50")
 
 @router.get("/groups/{group_name}/alert70")
-async def alert50(group_name: str):
+async def alert70(group_name: str):
     if group_name not in manager.play_groups:
         raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
     await manager.broadcast_to_group(group_name,"alert70")
 
 @router.get("/groups/{group_name}/alert90")
-async def alert50(group_name: str):
+async def alert90(group_name: str):
     if group_name not in manager.play_groups:
         raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
     await manager.broadcast_to_group(group_name,"alert90")
 
 @router.get("/paly-groups/{group_name}/turn-over")
-async def alert50(group_name: str):
+async def turn_over(group_name: str):
     if group_name not in manager.play_groups:
         raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
     manager.play_groups[group_name].turn_over()
     return manager.play_groups[group_name].to_dict()
 
+@router.get("/paly-groups/{group_name}")
+async def get_play_groups_by_group_name(group_name: str):
+    if group_name not in manager.play_groups:
+        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+    return manager.play_groups[group_name].to_dict()
