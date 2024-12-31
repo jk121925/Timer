@@ -1,74 +1,95 @@
-# routers/groups.py
 from fastapi import APIRouter, HTTPException
-from typing import List, Dict
-from core.connection_manager import manager, Client  # Client 클래스 임포트 추가
-from models import ClientAddRequest, BroadcastMessage, ClientInfo
+from typing import List
+from core.connection_manager import manager
 
 router = APIRouter()
 
 @router.post("/groups/{group_name}/broadcast")
-async def broadcast_message(group_name: str, message: BroadcastMessage):
-    await manager.broadcast_to_group(group_name, message.message)
+async def broadcast_message(group_name: str, message: str):
+    """
+    Broadcast a message to all players in the group.
+    """
+    if group_name not in manager.groups:
+        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+    await manager.broadcast_to_group(group_name, message)
     return {"message": "메시지가 브로드캐스트되었습니다."}
 
 @router.get("/groups", response_model=List[str])
 async def list_groups():
-    async with manager.lock:
-        return list(manager.groups.keys())
+    """
+    List all group names.
+    """
+    return list(manager.groups.keys())
 
-@router.get("/groups/{group_name}/clients")
-async def get_clients(group_name: str):
-    async with manager.lock:
-        if group_name not in manager.groups:
-            raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
-        clients = [client.to_dict() for client in manager.groups[group_name]]
-        return {
-            "group_name": group_name,
-            "clients": clients
-        }
+@router.get("/groups/{group_name}/players")
+async def get_players_in_group(group_name: str):
+    """
+    Get all players in a specific group.
+    """
+    if group_name not in manager.groups:
+        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+    return {
+        "group_name": group_name,
+        "players": manager.get_players_in_group(group_name)
+    }
 
 @router.post("/groups/{group_name}/reorder")
-async def reorder_group(group_name: str, new_order: List[str]):
-    await manager.reorder_group(group_name, new_order)
+async def reorder_group(group_name: str, new_order_id: List[str]):
+    """
+    Reorder players in a group by their player IDs.
+    """
+    if group_name not in manager.groups:
+        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+    await manager.reorder_group(group_name, new_order_id)
     return {"message": "그룹 순서가 업데이트되었습니다."}
 
-@router.post("/groups/{group_name}/start")
-async def reorder_group(group_name: str):
-    await manager.start_game(group_name)
-    return manager.play_groups[group_name].to_dict()
-
-@router.post("/groups/{group_name}/stop")
-async def reorder_group(group_name: str):
-    await manager.stop_game(group_name)
-    return {"message": "게임 종료."}
-
-@router.get("/groups/{group_name}/alert50")
-async def alert50(group_name: str):
-    if group_name not in manager.play_groups:
+@router.post("/play-groups/{group_name}/start")
+async def start_game(group_name: str):
+    """
+    Start a game for a specific group.
+    """
+    if group_name not in manager.groups:
         raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
-    await manager.broadcast_to_group(group_name,"alert50")
+    play_group = manager.start_game(group_name)
+    return play_group.to_dict()
 
-@router.get("/groups/{group_name}/alert70")
-async def alert70(group_name: str):
+@router.post("/play-groups/{group_name}/stop")
+async def stop_game(group_name: str):
+    """
+    Stop a game for a specific group.
+    """
     if group_name not in manager.play_groups:
-        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
-    await manager.broadcast_to_group(group_name,"alert70")
+        raise HTTPException(status_code=404, detail="플레이 중인 그룹을 찾을 수 없습니다.")
+    manager.stop_game(group_name)
+    return {"message": "게임이 종료되었습니다."}
 
-@router.get("/groups/{group_name}/alert90")
-async def alert90(group_name: str):
+@router.get("/play-groups/{group_name}/alert/{level}")
+async def send_alert(group_name: str, level: int):
+    """
+    Send an alert to a group with the given level (50, 70, 90).
+    """
     if group_name not in manager.play_groups:
-        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
-    await manager.broadcast_to_group(group_name,"alert90")
+        raise HTTPException(status_code=404, detail="플레이 중인 그룹을 찾을 수 없습니다.")
+    if level not in [50, 70, 90]:
+        raise HTTPException(status_code=400, detail="유효하지 않은 경고 수준입니다.")
+    await manager.broadcast_to_group(group_name, f"alert{level}")
+    return {"message": f"경고 {level}이 전송되었습니다."}
 
-@router.get("/paly-groups/{group_name}/turn-over")
+@router.post("/play-groups/{group_name}/turn-over")
 async def turn_over(group_name: str):
+    """
+    Advance the turn for a specific play group.
+    """
     if group_name not in manager.play_groups:
-        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="플레이 중인 그룹을 찾을 수 없습니다.")
     manager.play_groups[group_name].turn_over()
     return manager.play_groups[group_name].to_dict()
 
-@router.get("/paly-groups/{group_name}")
-async def get_play_groups_by_group_name(group_name: str):
+@router.get("/play-groups/{group_name}")
+async def get_play_group(group_name: str):
+    """
+    Get details of a specific play group.
+    """
     if group_name not in manager.play_groups:
-        raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+        raise HTTPException(status_code=404, detail="플레이 중인 그룹을 찾을 수 없습니다.")
     return manager.play_groups[group_name].to_dict()
