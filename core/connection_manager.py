@@ -1,216 +1,183 @@
-from typing import Dict, List, Optional
-from fastapi import WebSocket, HTTPException
+# your_project/core/connection_manager.py
+
 import uuid
 import asyncio
-from .Timer import Timer
+from typing import Dict, List, Optional
+from fastapi import WebSocket, HTTPException
 
-class Player:
-    def __init__(self, websocket: WebSocket, player_name: str):
-        self.websocket = websocket
-        self.player_id = str(uuid.uuid4())
-        self.player_name = player_name
-        self.is_host = False
-
-    def to_dict(self) -> dict:
-        return {
-            "player_id": self.player_id,
-            "player_name": self.player_name,
-            "is_host": self.is_host
-        }
-
-class Group:
-    def __init__(self, host_player: Player, timer_hours=0, timer_minutes=0, timer_seconds=0):
-        self.players: List[Player] = [host_player]
-        self.host_player = host_player
-        self.now_turn = 0
-        self.is_active = False  # Indicates if the group is in active play mode
-        self.timer = Timer(timer_hours, timer_minutes, timer_seconds)
-
-    def add_player(self, player: Player):
-        self.players.append(player)
-
-    def remove_player(self, player_id: str):
-        self.players = [player for player in self.players if player.player_id != player_id]
-
-    def get_player_ids(self) -> List[str]:
-        return [player.player_id for player in self.players]
-
-    def to_dict(self):
-        return {
-            "host_player": self.host_player.to_dict(),
-            "players": [player.to_dict() for player in self.players],
-            "now_turn": self.now_turn,
-            "is_active": self.is_active,
-            "remaining_time": self.timer.get_remaining_time()
-        }
-
-    def start_game(self):
-        if self.is_active:
-            raise ValueError("Game is already active.")
-        self.is_active = True
-        self.now_turn = 0
-        self.timer.start()
-
-    def stop_game(self):
-        if not self.is_active:
-            raise ValueError("Game is not active.")
-        self.is_active = False
-        self.now_turn = 0
-        self.timer.stop()
-
-    def pause_game(self):
-        if not self.is_active:
-            raise ValueError("Game is not active.")
-        self.is_active = False
-        self.timer.pause()
-
-    def turn_over(self):
-        if not self.is_active:
-            raise ValueError("Game is not active.")
-        self.now_turn = (self.now_turn + 1) % len(self.players)
+from core.player import Player
+from core.group import Group
 
 class ConnectionManager:
     def __init__(self):
         self.groups: Dict[str, Group] = {}
         self.lock = asyncio.Lock()
 
-    async def register_player(self, websocket: WebSocket, player_name: str):
+    async def broadcast_to_group(self, group_name: str, message: str):
+        """동일한 그룹 내 모든 플레이어에게 메시지 전송"""
         async with self.lock:
-            # Create a new host player and group
+            if group_name not in self.groups:
+                return
+            group = self.groups[group_name]
+            for p in group.players:
+                if p.websocket:
+                    try:
+                        await p.websocket.send_text(message)
+                    except Exception as e:
+                        print(f"[ConnectionManager] Broadcast failed: {e}")
+
+    def _make_broadcast_callback(self):
+        """Group에 주입할 콜백 함수. group_name, message -> await broadcast_to_group(group_name, message)"""
+        async def broadcast_cb(group_name: str, msg: str):
+            await self.broadcast_to_group(group_name, msg)
+        return broadcast_cb
+
+    async def register_player(self, websocket: WebSocket, player_name: str):
+        """
+        새로운 그룹을 생성하고 호스트 플레이어 등록
+        """
+        async with self.lock:
             host_player = Player(websocket, player_name)
             host_player.is_host = True
 
             group_name = f"group-{uuid.uuid4()}"
-            self.groups[group_name] = Group(host_player)
-            print(f"호스트 플레이어 '{host_player.player_id}'가 그룹 '{group_name}'을 생성했습니다.")
+
+            broadcast_cb = self._make_broadcast_callback()
+            new_group = Group(
+                group_name=group_name,
+                host_player=host_player,
+                broadcast_callback=broadcast_cb,
+                h=0, m=0, s=30   # 기본 30초 타이머 예시
+            )
+            self.groups[group_name] = new_group
+
+            print(f"[ConnectionManager] New group '{group_name}' created by '{player_name}'")
             return group_name, host_player
 
     async def join_group(self, host_player_id: str, guest_player_id: str):
+        """
+        호스트 그룹을 찾은 뒤, 게스트 플레이어를 그 그룹으로 이동
+        """
         async with self.lock:
-            # Find the host group by host player's ID
             host_group_name = None
-            for g_name, group in self.groups.items():
-                if group.host_player.player_id == host_player_id:
+            for g_name, grp in self.groups.items():
+                if grp.host_player.player_id == host_player_id:
                     host_group_name = g_name
                     break
-
             if not host_group_name:
-                raise HTTPException(status_code=404, detail="호스트 플레이어의 그룹을 찾을 수 없습니다.")
+                raise HTTPException(status_code=404, detail="호스트 그룹을 찾을 수 없습니다.")
 
-            # Find the guest player and their current group
             guest_player = None
             guest_group_name = None
-            for g_name, group in self.groups.items():
-                for player in group.players:
-                    if player.player_id == guest_player_id:
-                        guest_player = player
+            for g_name, grp in self.groups.items():
+                for p in grp.players:
+                    if p.player_id == guest_player_id:
+                        guest_player = p
                         guest_group_name = g_name
                         break
                 if guest_player:
                     break
-
             if not guest_player:
                 raise HTTPException(status_code=404, detail="게스트 플레이어를 찾을 수 없습니다.")
 
-            # Remove guest player from their current group
+            # 기존 그룹에서 제거
             if guest_group_name:
-                guest_group = self.groups[guest_group_name]
-                guest_group.remove_player(guest_player.player_id)
-                print(f"플레이어 '{guest_player.player_id}'가 그룹 '{guest_group_name}'에서 제거되었습니다.")
-
-                # Remove the group if empty
-                if not guest_group.players:
+                old_grp = self.groups[guest_group_name]
+                old_grp.remove_player(guest_player_id)
+                print(f"[ConnectionManager] Player '{guest_player_id}' removed from '{guest_group_name}'")
+                if not old_grp.players:
                     del self.groups[guest_group_name]
-                    print(f"그룹 '{guest_group_name}'이 비워져 삭제되었습니다.")
+                    print(f"[ConnectionManager] Group '{guest_group_name}' removed (empty)")
 
-            # Add guest player to the host group
+            # 호스트 그룹에 추가
             guest_player.is_host = False
-            host_group = self.groups[host_group_name]
-            host_group.add_player(guest_player)
-            print(f"플레이어 '{guest_player.player_id}'가 그룹 '{host_group_name}'에 추가되었습니다.")
+            host_grp = self.groups[host_group_name]
+            host_grp.add_player(guest_player)
+            print(f"[ConnectionManager] Player '{guest_player_id}' joined '{host_group_name}'")
+
             return host_group_name, guest_player
 
     async def reorder_group(self, group_name: str, new_order: List[str]) -> None:
-        """Reorder the players in the group based on the given order of player IDs."""
+        """그룹 플레이어 순서를 new_order 순으로 재정렬"""
         async with self.lock:
             if group_name not in self.groups:
                 raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
 
             group = self.groups[group_name]
-            player_dict = {player.player_id: player for player in group.players}
+            player_dict = {p.player_id: p for p in group.players}
 
-            # 요청된 순서대로 플레이어 정렬
-            reordered_players = []
-            for player_id in new_order:
-                if player_id in player_dict:
-                    reordered_players.append(player_dict[player_id])
-                else:
-                    raise HTTPException(status_code=400, detail=f"잘못된 플레이어 ID: {player_id}")
+            reordered = []
+            for pid in new_order:
+                if pid not in player_dict:
+                    raise HTTPException(status_code=400, detail=f"잘못된 플레이어 ID: {pid}")
+                reordered.append(player_dict[pid])
 
-            group.players = reordered_players
-            print(f"그룹 '{group_name}'의 순서가 업데이트되었습니다: {[p.player_name for p in reordered_players]}.")
+            group.players = reordered
+            print(f"[ConnectionManager] Group '{group_name}' reorder -> {[p.player_name for p in reordered]}")
 
     async def remove_connection_from_group(self, websocket: WebSocket) -> Optional[str]:
+        """WebSocket이 끊긴 플레이어를 소속 그룹에서 제거"""
         async with self.lock:
-            for group_name, group in list(self.groups.items()):
-                for player in group.players:
-                    if player.websocket == websocket:
-                        group.remove_player(player.player_id)
-                        print(f"플레이어 '{player.player_id}'가 그룹 '{group_name}'에서 제거되었습니다.")
-
-                        # Remove the group if empty
-                        if not group.players:
-                            del self.groups[group_name]
-                            print(f"그룹 '{group_name}'이 비워져 삭제되었습니다.")
-                        return group_name
+            for g_name, grp in list(self.groups.items()):
+                for p in grp.players:
+                    if p.websocket == websocket:
+                        grp.remove_player(p.player_id)
+                        print(f"[ConnectionManager] Player '{p.player_id}' removed from '{g_name}'")
+                        if not grp.players:
+                            del self.groups[g_name]
+                            print(f"[ConnectionManager] Group '{g_name}' removed (empty)")
+                        return g_name
             return None
 
-    async def broadcast_to_group(self, group_name: str, message: str):
-        async with self.lock:
-            if group_name in self.groups:
-                group = self.groups[group_name]
-                for player in group.players:
-                    if player.websocket:
-                        try:
-                            await player.websocket.send_text(message)
-                        except Exception as e:
-                            print(f"메시지 전송 실패: {e}")
+    def get_all_player(self):
+        """모든 플레이어 조회"""
+        players = []
+        for grp in self.groups.values():
+            players.extend(grp.players)
+        return players
 
-    def get_players_in_group(self, group_name: str) -> List[dict]:
+    def get_players_in_group(self, group_name: str):
         if group_name in self.groups:
-            return [player.to_dict() for player in self.groups[group_name].players]
-        else:
-            return []
+            return [p.to_dict() for p in self.groups[group_name].players]
+        return []
 
-    def start_game(self, group_name: str):
+    # --- 비동기로 그룹의 메서드를 호출 ---
+
+    async def start_game(self, group_name: str):
         if group_name not in self.groups:
             raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
         group = self.groups[group_name]
-        try:
-            group.start_game()
-            print(f"게임이 그룹 '{group_name}'에서 시작되었습니다.")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        await group.start_game()
+        print(f"[ConnectionManager] start_game -> '{group_name}'")
+        return group
 
-    def stop_game(self, group_name: str):
+    async def stop_game(self, group_name: str):
         if group_name not in self.groups:
             raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
         group = self.groups[group_name]
-        try:
-            group.stop_game()
-            print(f"게임이 그룹 '{group_name}'에서 종료되었습니다.")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        await group.stop_game()
+        print(f"[ConnectionManager] stop_game -> '{group_name}'")
 
-    def pause_game(self, group_name: str):
+    async def pause_game(self, group_name: str):
         if group_name not in self.groups:
             raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
         group = self.groups[group_name]
-        try:
-            group.pause_game()
-            print(f"게임이 그룹 '{group_name}'에서 일시 중지되었습니다.")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        await group.pause_game()
+        print(f"[ConnectionManager] pause_game -> '{group_name}'")
 
-# 싱글턴 패턴으로 인스턴스 생성
-manager = ConnectionManager()
+    async def resume_game(self, group_name: str):
+        if group_name not in self.groups:
+            raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+        group = self.groups[group_name]
+        await group.resume_game()
+        print(f"[ConnectionManager] resume_game -> '{group_name}'")
+
+    async def turn_over(self, group_name: str):
+        if group_name not in self.groups:
+            raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+        group = self.groups[group_name]
+        await group.turn_over()
+        print(f"[ConnectionManager] turn_over -> '{group_name}'")
+        return group
+
+manager = ConnectionManager()  # 싱글턴 인스턴스
